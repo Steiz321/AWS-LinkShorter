@@ -1,0 +1,404 @@
+service: aws-LinkShorter
+
+useDotenv: true
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  stage: prod
+  region: eu-central-1
+  environment:
+    DYNAMODB_LINKS_TABLE_NAME: ${self:custom.LinksTableName}
+    DYNAMODB_USERS_TABLE_NAME: ${self:custom.UsersTableName}
+    DYNAMODB_TOKENS_TABLE_NAME: ${self:custom.TokensTableName}
+    STAGE: ${self:provider.stage}
+    BCRYPT_SALT: ${env:BCRYPT_SALT}
+    JWT_ACCESS_SECRET: ${env:JWT_ACCESS_SECRET}
+    JWT_REFRESH_SECRET: ${env:JWT_REFRESH_SECRET}
+    TTL_ACCESS: ${env:TTL_ACCESS}
+    TTL_REFRESH: ${env:TTL_REFRESH}
+    SENDER_EMAIL: ${env:SENDER_EMAIL}
+    API_URL: !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}"
+
+
+plugins: 
+  - serverless-iam-roles-per-function
+  - serverless-dotenv-plugin
+  - serverless-plugin-scripts
+  - serverless-auto-swagger
+  - serverless-esbuild
+  - serverless-offline
+
+custom:
+  esbuild:
+    bundle: true
+    minify: false
+    concurrency: 10
+    target: "node18"
+  autoswagger:
+    typefiles: ['./src/types/apiDocs.ts']
+  LinksTableName: LinksTable
+  UsersTableName: UsersTable
+  TokensTableName: TokensTable
+  scripts:
+    hooks:
+      'after:deploy:finalize': node dist/hooks/verifySenderEmail.js
+
+functions:
+  getMyLinks:
+    handler: dist/functions/links/getMyLinks.handlerFunc
+    name: get-my-links
+    memorySize: 128 # mb
+    timeout: 5 # seconds
+    events: 
+      - http:
+          path: mylinks
+          method: GET
+          cors: true
+          authorizer:
+            name: authorizerFunc
+            resultTtlInSeconds: 60
+          description: "Security: Bearer auth"
+          responses:
+            200:
+              description: "Successfull API response"
+              bodyType: 'myLinksResponse'
+            401:
+              description: "Unauthtorized error"
+              bodyType: 'Unauthorized'
+    iamRoleStatements:
+      - Effect: "Allow"
+        Action: 
+          - "dynamodb:Scan"
+        Resource: !GetAtt LinksTable.Arn
+  createLink:
+    handler: dist/functions/links/createLink.handlerFunc
+    name: create-link
+    memorySize: 128 # mb
+    timeout: 5 # seconds
+    events: 
+      - http:
+          path: link
+          method: POST
+          cors: true
+          authorizer:
+            name: authorizerFunc
+            resultTtlInSeconds: 60
+          description: "Security: Bearer auth"
+          bodyType: 'createLink'
+          responses:
+            200:
+              description: "Successfull API response"
+              bodyType: 'createLinkResponse'
+            401:
+              description: "Unauthtorized error"
+              bodyType: 'Unauthorized'
+    iamRoleStatements:
+      - Effect: "Allow"
+        Action: 
+          - "dynamodb:Scan"
+          - "dynamodb:PutItem"
+          - "scheduler:CreateSchedule"
+          - "ses:*"
+        Resource: '*'
+      - Effect: "Allow"
+        Action:
+          - "iam:PassRole"
+        Resource: !GetAtt EventBridgerRole.Arn
+    environment:
+      FUNC_ARN: !GetAtt ScheduledDeactivateLambdaFunction.Arn
+      ROLE_ARN: !GetAtt EventBridgerRole.Arn
+  getLink:
+    handler: dist/functions/links/getLink.handlerFunc
+    name: get-link
+    memorySize: 128 # mb
+    timeout: 5 # seconds
+    events: 
+      - http:
+          path: /{linkParams}
+          method: GET
+          cors: true
+          responses:
+            302:
+              description: "Successfully redirected"
+            404:
+              description: "Link not found"
+              bodyType: 'serverError'
+    iamRoleStatements:
+      - Effect: "Allow"
+        Action: 
+          - "dynamodb:UpdateItem"
+          - "dynamodb:Scan"
+          - "sqs:*"
+          - "ses:*"
+        Resource: "*"
+    environment:
+      QUEUE_URL: !GetAtt EmailQueue.QueueUrl
+  deactivateLink:
+    handler: dist/functions/links/deactivateLink.handlerFunc
+    name: deactivate-link
+    events:
+      - http:
+          path: deactivate/{linkParams}
+          method: POST
+          cors: true
+          authorizer:
+            name: authorizerFunc
+            resultTtlInSeconds: 60
+          description: "Security: Bearer auth"
+          responses:
+            200:
+              description: "Successfull link deactivate"
+              bodyType: 'deactivateLinkResponse'
+            403:
+              description: "Forbidden"
+              bodyType: 'Forbidden'
+            404:
+              description: "Link not found"
+              bodyType: 'serverError'
+    iamRoleStatements:
+      - Effect: "Allow"
+        Action:
+          - "dynamodb:Scan"
+          - "dynamodb:UpdateItem"
+          - "sqs:*"
+          - "ses:*"
+        Resource:
+          - !GetAtt LinksTable.Arn
+          - !GetAtt EmailQueue.Arn
+    environment:
+      QUEUE_URL: !GetAtt EmailQueue.QueueUrl
+  reactiveLink:
+    handler: dist/functions/links/reactiveLink.handler
+    name: reactive-link
+    events:
+      - http:
+          path: reactive/{linkParams}
+          method: POST
+          cors: true
+          authorizer:
+            name: authorizerFunc
+            resultTtlInSeconds: 60
+          description: "Security: Bearer auth"
+          bodyType: 'reactiveLinkBody'
+          responses:
+            200:
+              description: "Successfull link reactivate"
+              bodyType: 'reactiveLinkResponse'
+            403:
+              description: "Forbidden"
+              bodyType: 'Forbidden'
+            404:
+              description: "Link not found"
+              bodyType: 'serverError'
+    iamRoleStatements:
+      - Effect: "Allow"
+        Action:
+          - "dynamodb:Scan"
+          - "dynamodb:UpdateItem"
+          - "scheduler:*"
+          - "sqs:*"
+          - "ses:*"
+        Resource: '*'
+      - Effect: "Allow"
+        Action:
+          - "iam:PassRole"
+        Resource: !GetAtt EventBridgerRole.Arn
+    environment:
+      FUNC_ARN: !GetAtt ScheduledDeactivateLambdaFunction.Arn
+      ROLE_ARN: !GetAtt EventBridgerRole.Arn
+  signUp:
+    handler: dist/functions/userAuth/signUp.handlerFunc
+    name: sign-up
+    events:
+      - http:
+          path: /sign-up
+          method: POST
+          cors: true
+          bodyType: 'signUpBody'
+          responses:
+            200:
+              description: "Successfull user creation"
+              bodyType: 'signUpResponse'
+            409:
+              description: "Confict during sign up (user is already exists)"
+              bodyType: 'Conflict'
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - "dynamodb:Scan"
+          - "dynamodb:PutItem"
+          - "ses:*"
+        Resource: "*"
+  signIn:
+    handler: dist/functions/userAuth/signIn.handlerFunc
+    name: sign-in
+    events:
+      - http:
+          path: /sign-in
+          method: POST
+          cors: true
+          bodyType: 'signInBody'
+          responses:
+            200:
+              description: "Successfull user sign in"
+              bodyType: 'signInResponse'
+            401:
+              description: "Unauthorized (wrong email or password)"
+              bodyType: 'Unauthorized'
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - "dynamodb:Scan"
+          - "dynamodb:UpdateItem"
+          - "dynamodb:PutItem"
+        Resource:
+          - !GetAtt UsersTable.Arn
+          - !GetAtt TokensTable.Arn
+  authorizerFunc:
+    handler: dist/functions/userAuth/authorizer.handlerFunc
+  sqsProcessor:
+    handler: dist/functions/sqs/sqsProcessor.handlerFunc
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - EmailQueue
+              - Arn
+    iamRoleStatements:
+      - Effect: 'Allow'
+        Action:
+          - "dynamodb:*"
+          - "ses:*"
+          - "sqs:*"
+        Resource: "*"
+  scheduledDeactivate:
+    handler: dist/functions/links/scheduledDeactivate.handlerFunc
+    events:
+      - eventBridge:
+          eventBus: default
+          pattern: 
+            source:
+              - "deactivate"
+            detail-type:
+              - "scheduledDeactivate"
+    iamRoleStatements:
+      - Effect: "Allow"
+        Action:
+          - "dynamodb:*"
+          - "sqs:SendMessage"
+          - "ses:*"
+          - "events:*"
+          - "scheduler:*"
+        Resource: "*"
+    iamRoleStatementsName: scheduled-deactivate-role
+    environment:
+      QUEUE_URL: !GetAtt EmailQueue.QueueUrl
+
+resources:
+  Resources:
+    EventBridgerRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: IAMForEventBridge
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+                  - events.amazonaws.com
+                  - scheduler.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Policies:
+          - PolicyName: LambdaInvokeAccess
+            PolicyDocument: 
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource: "*"
+        
+    ShortUrlEvent:
+      Type: AWS::Events::Rule
+      Properties:
+        EventPattern:
+          source:
+            - "deactivate"
+          detail-type:
+            - "scheduledDeactivate"
+        Targets:
+          - Arn: !GetAtt ScheduledDeactivateLambdaFunction.Arn
+            Id: "TargetDeactivate"
+
+    EmailQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: emailQueue
+
+    UsersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: UsersTable
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+        ProvisionedThroughput:
+            ReadCapacityUnits: 4
+            WriteCapacityUnits: 4
+    LinksTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: LinksTable
+        AttributeDefinitions:
+          - AttributeName: linkId
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: linkId
+            KeyType: HASH
+        ProvisionedThroughput:
+            ReadCapacityUnits: 4
+            WriteCapacityUnits: 4
+        GlobalSecondaryIndexes:
+          - IndexName: UserIndex
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+            ProvisionedThroughput:
+              ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+    TokensTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: TokensTable
+        AttributeDefinitions:
+          - AttributeName: tokenId
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tokenId
+            KeyType: HASH
+        ProvisionedThroughput:
+            ReadCapacityUnits: 4
+            WriteCapacityUnits: 4
+        GlobalSecondaryIndexes:
+          - IndexName: UserIndex
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+            ProvisionedThroughput:
+              ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
